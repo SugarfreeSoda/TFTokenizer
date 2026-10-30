@@ -61,42 +61,5 @@ All tunable values live in `Params` (`tftokenizer/tokenizer.py`).
 [`examples/quickstart.ipynb`](examples/quickstart.ipynb) reproduces the whole run: download, fit on chr19,
 tokenize chr19 and chr22, and load the result.
 
-## Output
 
-For each chromosome, `tokens/<chrom>/` contains:
 
-| file | content |
-|---|---|
-| `bins.npy` | token edges (int64, length n + 1); token *i* covers `[bins[i], bins[i+1])`. The last edge is the end of the last hit |
-| `tokens.zarr` | float32 array, n tokens × motifs |
-| `columns.json` | motif IDs of the columns |
-
-```python
-import numpy as np, zarr
-bins = np.load("tokens/chr22/bins.npy")
-tokens = zarr.open_array("tokens/chr22/tokens.zarr", mode="r")
-```
-
-While a chromosome is being tokenized, a temporary site list (about 2.5 GB for chr22) lives in a temporary folder inside
-its output directory. The folder is removed automatically when the chromosome is done, also if the run is interrupted.
-
-## Performance
-
-Measured with `examples/quickstart.ipynb` on a laptop with 15 CPU cores and 24 GB RAM:
-
-| | chr19 | chr22 |
-|---|---|---|
-| `fit` (score histograms) | 42 s | – |
-| `tokenize` | 81 s | 58 s |
-| tokens | 4,269,096 | 3,330,257 |
-| `tokens.zarr` on disk | 1.4 GB | 1.0 GB |
-
-## Development
-
-Building from a clone needs a Rust toolchain; `pip install -e` compiles the Rust core and places it in the package.
-
-```bash
-pip install -e '.[test]' && pytest
-```
-
-Releases: pushing a tag `vX.Y.Z` builds the wheels on GitHub Actions and publishes them to PyPI.
