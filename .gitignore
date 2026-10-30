@@ -1,0 +1,9 @@
+target/
+__pycache__/
+*.egg-info/
+.DS_Store
+examples/data/
+examples/tokens/
+tftokenizer/_native*
+dist/
+build/

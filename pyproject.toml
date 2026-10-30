@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77", "setuptools-rust>=1.9"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tftokenizer"
+version = "0.1.0"
+description = "Tokenize the genome into bins carrying per-motif transcription-factor occupancy"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "scipy>=1.11", "zarr>=3"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+tftokenizer = "tftokenizer.cli:main"
+
+[tool.setuptools]
+packages = ["tftokenizer"]
+
+[[tool.setuptools-rust.ext-modules]]
+target = "tftokenizer._native"
+binding = "NoBinding"
+py-limited-api = true
+
+[tool.distutils.bdist_wheel]
+py-limited-api = "cp311"
+
+[tool.cibuildwheel]
+build = "cp311-*"
+skip = "*-musllinux_*"
+archs = ["native"]
+test-requires = "pytest"
+test-command = "pytest {project}/tests"
+
+[tool.cibuildwheel.linux]
+before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+environment = { PATH = "$PATH:$HOME/.cargo/bin" }
