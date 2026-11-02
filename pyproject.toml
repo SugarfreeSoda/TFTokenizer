@@ -25,6 +25,7 @@ packages = ["tftokenizer"]
 target = "tftokenizer._native"
 binding = "NoBinding"
 py-limited-api = true
+debug = false  # release build also for editable installs (pip install -e .)
 
 [tool.distutils.bdist_wheel]
 py-limited-api = "cp311"
@@ -39,3 +40,7 @@ test-command = "pytest {project}/tests"
 [tool.cibuildwheel.linux]
 before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
 environment = { PATH = "$PATH:$HOME/.cargo/bin" }
+
+[[tool.cibuildwheel.overrides]]
+select = "*-macosx_x86_64"
+environment = { MACOSX_DEPLOYMENT_TARGET = "10.12" }  # Rust's standard library needs macOS ≥ 10.12 on Intel Macs

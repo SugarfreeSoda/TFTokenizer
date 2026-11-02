@@ -1,12 +1,13 @@
 //! Rust core of TFTokenizer: stream motif hits, merge them into occupancy sites, and sum sites into bin features.
 //! A site record is four little-endian u32: start, end, motif index, per-base weight (f32 bits). Sites are written sorted by end.
-use flate2::read::MultiGzDecoder;
+//! The optional merge record of a site is u32 merged hits + f32 Σa, in the same order.
+use flate2::{bufread::ZlibDecoder, read::MultiGzDecoder, write::GzEncoder, Compression};
 use rayon::prelude::*;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::ffi::{c_char, CStr};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::slice;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -106,8 +107,52 @@ pub extern "C" fn tt_histogram(hits: *const c_char, chrom: *const c_char, max_mo
     })(), error, capacity)
 }
 
+/// Unpacks the data blocks of one chromosome cut out of a bigBed file — concatenated zlib streams of records u32 chromId,
+/// start, end, then the other fields '\t'-joined and NUL-terminated — into a gzipped TSV with `header` as first line, as
+/// bigBedToBed -tsv writes it. Every record must belong to `chrom_id`. Returns the number of records.
+#[no_mangle]
+pub extern "C" fn tt_unpack(blocks: *const c_char, chrom: *const c_char, chrom_id: u32, header: *const c_char, out: *const c_char,
+                            level: u32, rows: *mut u64, error: *mut u8, capacity: usize) -> i32 {
+    report((|| {
+        let chrom = text(chrom)?.as_bytes();
+        let mut input = BufReader::with_capacity(1 << 22, File::open(text(blocks)?)?);
+        let mut out = GzEncoder::new(BufWriter::with_capacity(1 << 22, File::create(text(out)?)?), Compression::new(level));
+        writeln!(out, "{}", text(header)?)?;
+        let (mut block, mut lines, mut n) = (Vec::new(), Vec::new(), 0u64);
+        while !input.fill_buf()?.is_empty() {
+            let mut z = ZlibDecoder::new(input);   // stops at the end of one block's stream
+            block.clear();
+            z.read_to_end(&mut block)?;
+            input = z.into_inner();
+            lines.clear();
+            let mut rest = &block[..];
+            while !rest.is_empty() {
+                let end = 12 + rest.iter().skip(12).position(|&b| b == 0).ok_or("truncated bigBed record")?;
+                let word = |k: usize| u32::from_le_bytes(rest[4 * k..4 * k + 4].try_into().unwrap());
+                if word(0) != chrom_id {
+                    return Err(format!("record of chromosome #{} among those of #{chrom_id}", word(0)).into());
+                }
+                lines.extend_from_slice(chrom);
+                write!(lines, "\t{}\t{}", word(1), word(2))?;
+                if end > 12 {
+                    lines.push(b'\t');
+                    lines.extend_from_slice(&rest[12..end]);
+                }
+                lines.push(b'\n');
+                rest = &rest[end + 1..];
+                n += 1;
+            }
+            out.write_all(&lines)?;
+        }
+        out.finish()?.flush()?;
+        unsafe { *rows = n };
+        Ok(())
+    })(), error, capacity)
+}
+
 struct Sink {
     out: BufWriter<File>,
+    merge: Option<BufWriter<File>>,
     theta_max: f64,
     count: u64,
     longest: u32,
@@ -116,7 +161,8 @@ struct Sink {
 
 impl Sink {
     /// Site occupancy θ = Σa / (1 + Σa) (capped), load H = −ln(1 − θ), written as per-base weight H / length.
-    fn close(&mut self, motif: usize, (start, end, total): (u32, u32, f64)) -> Result<()> {
+    /// The merge file, if any, gets the number of merged hits and Σa (u32, f32) of the same site.
+    fn close(&mut self, motif: usize, (start, end, total, hits): (u32, u32, f64, u32)) -> Result<()> {
         let theta = (total / (1.0 + total)).min(self.theta_max);
         let load = -(-theta).ln_1p();
         if load <= 0.0 {
@@ -125,6 +171,10 @@ impl Sink {
         let w = (load / (end - start) as f64) as f32;
         for v in [start, end, motif as u32, w.to_bits()] {
             self.out.write_all(&v.to_le_bytes())?;
+        }
+        if let Some(merge) = &mut self.merge {
+            merge.write_all(&hits.to_le_bytes())?;
+            merge.write_all(&(total as f32).to_le_bytes())?;
         }
         self.count += 1;
         self.longest = self.longest.max(end - start);
@@ -135,16 +185,20 @@ impl Sink {
 
 /// Merges overlapping hits of the same motif (both strands) into sites and writes them sorted by end.
 /// `table[m * 1001 + score]` is the relative binding strength a of motif m. Also returns the longest site and the last hit end.
-/// Hits must be sorted by chromStart (bigBedToBed output is).
+/// An empty `merge` path skips the merge file. Hits must be sorted by chromStart (bigBedToBed output is).
 #[no_mangle]
 pub extern "C" fn tt_scan(hits: *const c_char, chrom: *const c_char, motifs: *const c_char, table: *const f32, theta_max: f64,
-                          sites: *const c_char, n_sites: *mut u64, max_len: *mut u32, max_end: *mut u32,
+                          sites: *const c_char, merge: *const c_char, n_sites: *mut u64, max_len: *mut u32, max_end: *mut u32,
                           error: *mut u8, capacity: usize) -> i32 {
     report((|| {
         let names: HashMap<&[u8], usize> = text(motifs)?.as_bytes().split(|&b| b == b'\n').enumerate().map(|(i, m)| (m, i)).collect();
         let table = unsafe { slice::from_raw_parts(table, names.len() * SCORES) };
-        let mut sink = Sink { out: BufWriter::with_capacity(1 << 22, File::create(text(sites)?)?), theta_max, count: 0, longest: 0, max_end: 0 };
-        let mut open = vec![(0u32, 0u32, 0f64); names.len()];        // open site per motif; end = 0 means none
+        let merge = match text(merge)? {
+            "" => None,
+            path => Some(BufWriter::with_capacity(1 << 22, File::create(path)?)),
+        };
+        let mut sink = Sink { out: BufWriter::with_capacity(1 << 22, File::create(text(sites)?)?), merge, theta_max, count: 0, longest: 0, max_end: 0 };
+        let mut open = vec![(0u32, 0u32, 0f64, 0u32); names.len()];   // open site per motif: start, end, Σa, hits; end = 0 means none
         let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();   // (end, motif); stale entries are skipped
         let mut previous = 0;
         each_hit(text(hits)?, text(chrom)?, |start, end, motif, score| {
@@ -167,12 +221,13 @@ pub extern "C" fn tt_scan(hits: *const c_char, chrom: *const c_char, motifs: *co
             let site = &mut open[m];
             if site.1 > start {
                 site.2 += a;
+                site.3 += 1;
                 if end > site.1 {
                     site.1 = end;
                     heap.push(Reverse((end, m)));
                 }
             } else {
-                *site = (start, end, a);
+                *site = (start, end, a, 1);
                 heap.push(Reverse((end, m)));
             }
             Ok(())
@@ -184,6 +239,9 @@ pub extern "C" fn tt_scan(hits: *const c_char, chrom: *const c_char, motifs: *co
             }
         }
         sink.out.flush()?;
+        if let Some(merge) = &mut sink.merge {
+            merge.flush()?;
+        }
         unsafe {
             *n_sites = sink.count;
             *max_len = sink.longest;
@@ -191,6 +249,12 @@ pub extern "C" fn tt_scan(hits: *const c_char, chrom: *const c_char, motifs: *co
         }
         Ok(())
     })(), error, capacity)
+}
+
+/// Number of threads used for bin features.
+#[no_mangle]
+pub extern "C" fn tt_threads() -> usize {
+    rayon::current_num_threads()
 }
 
 /// Summed per-base weight of all sites: out[x] = Σ weight of the sites covering base x.
@@ -210,6 +274,41 @@ pub extern "C" fn tt_density(sites: *const [u32; 4], n_sites: usize, length: usi
     for v in out.iter_mut() {
         total += *v;
         *v = total;
+    }
+}
+
+/// Gaussian smoothing in place, computed as scipy.ndimage.gaussian_filter1d (mode "reflect"):
+/// x[i] ← w[0] x[i] + Σ_{j = r…1} (x[i − j] + x[i + j]) w[j]. Each result waits r positions in a queue before it
+/// overwrites x, so every read sees an original value; extra memory is r + 1 numbers.
+#[no_mangle]
+pub extern "C" fn tt_smooth(x: *mut f64, length: usize, w: *const f64, radius: usize) {
+    let x = unsafe { slice::from_raw_parts_mut(x, length) };
+    let w = unsafe { slice::from_raw_parts(w, radius + 1) };
+    let n = length as i64;
+    let reflect = |k: i64| {
+        let m = k.rem_euclid(2 * n);
+        (if m < n { m } else { 2 * n - 1 - m }) as usize
+    };
+    let mut queue = VecDeque::with_capacity(radius + 1);
+    for i in 0..length {
+        let mut v = x[i] * w[0];
+        if i >= radius && i + radius < length {
+            for j in (1..=radius).rev() {
+                v += (x[i - j] + x[i + j]) * w[j];
+            }
+        } else {
+            for j in (1..=radius).rev() {
+                v += (x[reflect(i as i64 - j as i64)] + x[reflect((i + j) as i64)]) * w[j];
+            }
+        }
+        queue.push_back(v);
+        if queue.len() > radius {
+            x[i - radius] = queue.pop_front().unwrap();
+        }
+    }
+    let start = length - queue.len();
+    for (k, v) in queue.into_iter().enumerate() {
+        x[start + k] = v;
     }
 }
 
