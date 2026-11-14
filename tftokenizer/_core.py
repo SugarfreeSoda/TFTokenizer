@@ -15,7 +15,7 @@ def lib():
         ptr = lambda dtype: np.ctypeslib.ndpointer(dtype=dtype, flags="C_CONTIGUOUS")
         err = [ct.c_char_p, ct.c_size_t]
         _lib.tt_histogram.argtypes = [ct.c_char_p, ct.c_char_p, ct.c_size_t, ptr(np.uint64), ct.c_char_p, ct.c_size_t, ct.POINTER(ct.c_size_t)] + err
-        _lib.tt_scan.argtypes = [ct.c_char_p, ct.c_char_p, ct.c_char_p, ptr(np.float32), ct.c_double, ct.c_char_p, ct.c_char_p,
+        _lib.tt_scan.argtypes = [ct.c_char_p, ct.c_char_p, ct.c_char_p, ptr(np.float32), ct.c_char_p, ct.c_char_p,
                                  ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint32), ct.POINTER(ct.c_uint32)] + err
         _lib.tt_unpack.argtypes = [ct.c_char_p, ct.c_char_p, ct.c_uint32, ct.c_char_p, ct.c_char_p, ct.c_uint32, ct.POINTER(ct.c_uint64)] + err
         _lib.tt_threads.restype = ct.c_size_t
@@ -41,11 +41,11 @@ def histogram(hits, chrom):
     return names.value.decode().split("\n")[:n.value], counts[:n.value]
 
 
-def scan(hits, chrom, motifs, table, theta_max, sites_path, merge_path=None):
-    """Writes occupancy sites to sites_path (and their merge records to merge_path, if given);
-    returns (number of sites, longest site, end of the last site)."""
+def scan(hits, chrom, motifs, table, sites_path, merge_path=None):
+    """Writes the segments of constant per-base occupancy to sites_path (and their merge records to merge_path, if given);
+    returns (number of segments, longest segment, end of the last segment)."""
     n, longest, end, error = ct.c_uint64(), ct.c_uint32(), ct.c_uint32(), ct.create_string_buffer(1024)
-    _check(lib().tt_scan(os.fsencode(hits), chrom.encode(), "\n".join(motifs).encode(), np.ascontiguousarray(table, np.float32), theta_max,
+    _check(lib().tt_scan(os.fsencode(hits), chrom.encode(), "\n".join(motifs).encode(), np.ascontiguousarray(table, np.float32),
                          os.fsencode(sites_path), os.fsencode(merge_path or ""), ct.byref(n), ct.byref(longest), ct.byref(end),
                          error, len(error)), error)
     return n.value, longest.value, end.value
@@ -64,7 +64,7 @@ def threads():
 
 
 def density(sites, length):
-    """Summed per-base load of all sites."""
+    """Summed per-base occupancy of all motifs."""
     out = np.empty(length)
     lib().tt_density(sites, len(sites), length, out)
     return out
@@ -79,7 +79,7 @@ def smooth(x, sigma, truncate=4.0):
 
 
 def features(sites, max_len, edges, n_motifs):
-    """Bin × motif matrix of Σ site load × fraction of the site inside the bin."""
+    """Bin × motif matrix of Σ θ over the bases of the bin (expected occupied bases)."""
     out = np.empty((len(edges) - 1, n_motifs))
     lib().tt_features(sites, len(sites), max_len, np.ascontiguousarray(edges, np.int64), len(edges), n_motifs, out)
     return out

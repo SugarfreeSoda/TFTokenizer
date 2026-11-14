@@ -1,22 +1,35 @@
 # TFTokenizer
 
 TFTokenizer cuts a chromosome into variable-length tokens from transcription-factor motif hits. Each token
-records the expected occupancy of every motif inside it.
+records, for every motif, the expected number of its bases occupied by that motif.
 
 It builds on the interval tokenizer of *Motif-aware Tokenization of the Genome: Towards Interpretable Modeling of
-Gene Regulation*. That tokenizer marks each motif hit as 0/1. TFTokenizer instead weights each hit by its binding
-strength and merges overlapping hits of a motif into occupancy sites.
+Gene Regulation*. That tokenizer marks each motif hit as 0/1. TFTokenizer instead weights each hit by its rank among
+the hits of its motif.
 
 ## Method
 
-1. **Binding strength.** A hit of motif *m* with JASPAR score *s* gets strength a = exp(β (S − μ<sub>m</sub>)), where
-   S = s / 100 · ln 10 (= −ln p). μ<sub>m</sub> is the 90th percentile of motif *m*'s scores on the training chromosomes,
-   and β = 0.5.
-2. **Occupancy sites.** Overlapping hits of the same motif (both strands) are merged into one site, with occupancy
-   θ = Σa / (1 + Σa) (capped at 0.99) and load H = −ln(1 − θ). H is spread evenly over the site, so each base carries H / site length.
-3. **Bins.** The per-base load of all motifs is summed and smoothed (Gaussian, σ = 3). Every peak contributes its two
+1. **Rank odds.** A hit of motif *m* gets a = u / (1 − u). u is the percentile of its JASPAR score among the hits of
+   motif *m* on the training chromosomes: (hits scoring lower + half of those scoring the same) / N.
+2. **Per-base occupancy.** Every base gets θ<sub>m</sub>(x) = A / (1 + A), where A is the sum of a over the hits of
+   motif *m* (both strands) covering it. A base under a single hit has θ = u; overlapping hits add up and stay below 1.
+3. **Bins.** θ of all motifs is summed per base and smoothed (Gaussian, σ = 3). Every peak contributes its two
    crossings at half its prominence as bin edges. Stretches longer than 50 bp are cut every 25 bp.
-4. **Tokens.** For each bin and motif, the token value is Σ site load × fraction of the site inside the bin.
+4. **Tokens.** For each bin and motif, the token value is Σ θ<sub>m</sub>(x) over the bases of the bin: the expected
+   number of bases of the bin occupied by motif *m*.
+
+There are no tunable weights.
+
+### Changes from 0.1
+
+Version 0.1 used a = exp(β (S − μ<sub>m</sub>)), merged overlapping hits into sites and spread the load
+H = −ln(1 − θ) of a site over its length. Input tables, commands and output files are the same in 0.2, but:
+
+- token values differ, and bin edges shift slightly;
+- a model fitted with 0.1 cannot be loaded: run `fit` again;
+- `sites.bin` holds segments of constant θ instead of merged sites, and `merge.bin` the hits covering each segment.
+
+The old method stays available with `pip install tftokenizer==0.1.0`.
 
 ## Install
 
