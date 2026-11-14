@@ -17,20 +17,11 @@ def make_hits(path, n_hits=3_000, seed=0):
 
 
 def reference(tok, start, end, motif, score):
-    """Per-base occupancy track of each motif, built directly from the hits."""
-    a, track = tok.table(), np.zeros((len(tok.motifs), LENGTH))
-    for k in range(len(tok.motifs)):
-        sel = np.flatnonzero(motif == k)
-        sites, cur = [], None
-        for i in sel[np.lexsort((end[sel], start[sel]))]:
-            if cur and start[i] < cur[1]:
-                cur = [cur[0], max(cur[1], end[i]), cur[2] + float(a[k, score[i]])]
-            else:
-                sites += [cur] if cur else []
-                cur = [start[i], end[i], float(a[k, score[i]])]
-        for s, e, total in sites + [cur]:
-            track[k, s:e] += np.float32(-np.log1p(-min(total / (1 + total), tok.params.theta_max)) / (e - s))
-    return track
+    """Per-base occupancy θ = Σa / (1 + Σa) of each motif, built directly from the hits."""
+    a, total = tok.table(), np.zeros((len(tok.motifs), LENGTH))
+    for s, e, k, sc in zip(start, end, motif, score):
+        total[k, s:e] += a[k, sc]
+    return (total / (1 + total)).astype(np.float32)
 
 
 def test_smooth_matches_scipy():
@@ -52,6 +43,11 @@ def test_tokens_match_reference(tmp_path):
     expected = np.add.reduceat(reference(tok, start, end, motif, score)[:, :edges[-1]], edges[:-1], axis=1).T
     assert sorted(f.name for f in out.iterdir()) == ["bins.npy", "columns.json", "tokens.zarr"]
     assert tok.motifs == motifs and json.loads((out / "columns.json").read_text()) == motifs
+    a = tok.table().astype(np.float64)                 # a single hit gets θ = its mid-rank percentile among the hits of its motif
+    for k in range(3):
+        s = score[motif == k]
+        u = ((s[:, None] < s).sum(0) + 0.5 * (s[:, None] == s).sum(0)) / len(s)
+        assert np.allclose((a / (1 + a))[k, s], u, rtol=1e-6)
     assert edges[0] == 0 and edges[-1] == end.max() and np.allclose(X, expected, rtol=1e-5, atol=1e-7)
     tok.save(tmp_path / "model.npz")
     again = TFTokenizer.load(tmp_path / "model.npz").tokenize(hits, "chr1", tmp_path / "again")
@@ -71,11 +67,11 @@ def test_optional_outputs(tmp_path):
     assert list(tok.log) == ["histogram chr1"] and list(run["steps"]) == ["scan", "density", "bins", "features", "write"]
     sites, merge = read_sites(out)
     ref = reference(tok, start, end, motif, score)[:, :edges[-1]]
-    assert run["sites"] == len(sites) == len(merge) and merge["hits"].sum() == len(start)
+    assert run["sites"] == len(sites) == len(merge)
+    assert (merge["hits"] * (sites["end"] - sites["start"]).astype(np.int64)).sum() == (end - start).sum()   # every base of every hit once
     assert all(np.allclose(track(sites[sites["motif"] == k], 0, edges[-1]), ref[k], rtol=1e-5, atol=1e-7) for k in range(len(motifs)))
     total = merge["total"].astype(np.float64)
-    H = -np.log1p(-np.minimum(total / (1 + total), tok.params.theta_max))
-    assert np.allclose(sites["weight"] * (sites["end"] - sites["start"]), H, rtol=1e-5)
+    assert np.allclose(sites["weight"], total / (1 + total), rtol=1e-5)
     peaks = np.load(out / "peaks.npz")
     cut = peaks["cut"]
     assert np.all(edges[cut] - edges[np.flatnonzero(cut) - 1] == tok.params.step)

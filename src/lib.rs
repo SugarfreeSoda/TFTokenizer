@@ -1,6 +1,6 @@
-//! Rust core of TFTokenizer: stream motif hits, merge them into occupancy sites, and sum sites into bin features.
-//! A site record is four little-endian u32: start, end, motif index, per-base weight (f32 bits). Sites are written sorted by end.
-//! The optional merge record of a site is u32 merged hits + f32 Σa, in the same order.
+//! Rust core of TFTokenizer: stream motif hits, turn them into the per-base occupancy θ of every motif, and sum θ into bin features.
+//! A record is four little-endian u32: start, end, motif index, per-base weight θ (f32 bits) — one segment of constant θ.
+//! Records are written sorted by end. The optional merge record of a segment is u32 hits covering it + f32 Σa, in the same order.
 use flate2::{bufread::ZlibDecoder, read::MultiGzDecoder, write::GzEncoder, Compression};
 use rayon::prelude::*;
 use std::cmp::Reverse;
@@ -153,23 +153,20 @@ pub extern "C" fn tt_unpack(blocks: *const c_char, chrom: *const c_char, chrom_i
 struct Sink {
     out: BufWriter<File>,
     merge: Option<BufWriter<File>>,
-    theta_max: f64,
     count: u64,
     longest: u32,
     max_end: u32,
 }
 
 impl Sink {
-    /// Site occupancy θ = Σa / (1 + Σa) (capped), load H = −ln(1 − θ), written as per-base weight H / length.
-    /// The merge file, if any, gets the number of merged hits and Σa (u32, f32) of the same site.
-    fn close(&mut self, motif: usize, (start, end, total, hits): (u32, u32, f64, u32)) -> Result<()> {
-        let theta = (total / (1.0 + total)).min(self.theta_max);
-        let load = -(-theta).ln_1p();
-        if load <= 0.0 {
+    /// One segment on which the hits of a motif covering each base stay the same: θ = Σa / (1 + Σa) is its per-base weight.
+    /// The merge file, if any, gets the number of those hits and Σa (u32, f32) of the same segment.
+    fn write(&mut self, motif: usize, start: u32, end: u32, total: f64, hits: u32) -> Result<()> {
+        let theta = total / (1.0 + total);
+        if theta <= 0.0 {
             return Ok(());
         }
-        let w = (load / (end - start) as f64) as f32;
-        for v in [start, end, motif as u32, w.to_bits()] {
+        for v in [start, end, motif as u32, (theta as f32).to_bits()] {
             self.out.write_all(&v.to_le_bytes())?;
         }
         if let Some(merge) = &mut self.merge {
@@ -183,11 +180,24 @@ impl Sink {
     }
 }
 
-/// Merges overlapping hits of the same motif (both strands) into sites and writes them sorted by end.
-/// `table[m * 1001 + score]` is the relative binding strength a of motif m. Also returns the longest site and the last hit end.
-/// An empty `merge` path skips the merge file. Hits must be sorted by chromStart (bigBedToBed output is).
+/// A hit of motif k ends at e: closes the open segment of k there and takes the hit's a out of Σa.
+fn expire(sink: &mut Sink, open: &mut [(u32, f64, u32)], (e, k, a): (u32, usize, u32)) -> Result<()> {
+    let seg = &mut open[k];
+    if e > seg.0 {
+        sink.write(k, seg.0, e, seg.1, seg.2)?;
+        seg.0 = e;
+    }
+    seg.2 -= 1;
+    seg.1 = if seg.2 == 0 { 0.0 } else { (seg.1 - f32::from_bits(a) as f64).max(0.0) };   // 0 hits: drop rounding residue
+    Ok(())
+}
+
+/// Per-base occupancy of every motif (both strands): each base gets θ = Σa / (1 + Σa) over the hits of the motif covering it.
+/// Writes the segments of constant θ sorted by end. `table[m * 1001 + score]` is the rank odds a of motif m.
+/// Also returns the longest segment and the last hit end. An empty `merge` path skips the merge file.
+/// Hits must be sorted by chromStart (bigBedToBed output is).
 #[no_mangle]
-pub extern "C" fn tt_scan(hits: *const c_char, chrom: *const c_char, motifs: *const c_char, table: *const f32, theta_max: f64,
+pub extern "C" fn tt_scan(hits: *const c_char, chrom: *const c_char, motifs: *const c_char, table: *const f32,
                           sites: *const c_char, merge: *const c_char, n_sites: *mut u64, max_len: *mut u32, max_end: *mut u32,
                           error: *mut u8, capacity: usize) -> i32 {
     report((|| {
@@ -197,9 +207,9 @@ pub extern "C" fn tt_scan(hits: *const c_char, chrom: *const c_char, motifs: *co
             "" => None,
             path => Some(BufWriter::with_capacity(1 << 22, File::create(path)?)),
         };
-        let mut sink = Sink { out: BufWriter::with_capacity(1 << 22, File::create(text(sites)?)?), merge, theta_max, count: 0, longest: 0, max_end: 0 };
-        let mut open = vec![(0u32, 0u32, 0f64, 0u32); names.len()];   // open site per motif: start, end, Σa, hits; end = 0 means none
-        let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();   // (end, motif); stale entries are skipped
+        let mut sink = Sink { out: BufWriter::with_capacity(1 << 22, File::create(text(sites)?)?), merge, count: 0, longest: 0, max_end: 0 };
+        let mut open = vec![(0u32, 0f64, 0u32); names.len()];   // per motif: start of the open segment, Σa and number of hits covering it
+        let mut heap: BinaryHeap<Reverse<(u32, usize, u32)>> = BinaryHeap::new();   // (end, motif, a as f32 bits) of every hit not yet ended
         let mut previous = 0;
         each_hit(text(hits)?, text(chrom)?, |start, end, motif, score| {
             if start < previous || start >= end {
@@ -207,36 +217,24 @@ pub extern "C" fn tt_scan(hits: *const c_char, chrom: *const c_char, motifs: *co
             }
             previous = start;
             let Some(&m) = names.get(motif) else { return Ok(()) };
-            while let Some(&Reverse((e, k))) = heap.peek() {
-                if e > start {
+            while let Some(&Reverse(hit)) = heap.peek() {
+                if hit.0 > start {
                     break;
                 }
                 heap.pop();
-                if open[k].1 == e {
-                    sink.close(k, open[k])?;
-                    open[k].1 = 0;
-                }
+                expire(&mut sink, &mut open, hit)?;
             }
-            let a = table[m * SCORES + score] as f64;
-            let site = &mut open[m];
-            if site.1 > start {
-                site.2 += a;
-                site.3 += 1;
-                if end > site.1 {
-                    site.1 = end;
-                    heap.push(Reverse((end, m)));
-                }
-            } else {
-                *site = (start, end, a, 1);
-                heap.push(Reverse((end, m)));
+            let a = table[m * SCORES + score];
+            let seg = &mut open[m];
+            if seg.2 > 0 && start > seg.0 {
+                sink.write(m, seg.0, start, seg.1, seg.2)?;
             }
+            *seg = (start, seg.1 + a as f64, seg.2 + 1);
+            heap.push(Reverse((end, m, a.to_bits())));
             Ok(())
         })?;
-        while let Some(Reverse((e, k))) = heap.pop() {
-            if open[k].1 == e {
-                sink.close(k, open[k])?;
-                open[k].1 = 0;
-            }
+        while let Some(Reverse(hit)) = heap.pop() {
+            expire(&mut sink, &mut open, hit)?;
         }
         sink.out.flush()?;
         if let Some(merge) = &mut sink.merge {
@@ -257,7 +255,7 @@ pub extern "C" fn tt_threads() -> usize {
     rayon::current_num_threads()
 }
 
-/// Summed per-base weight of all sites: out[x] = Σ weight of the sites covering base x.
+/// Summed occupancy of all motifs: out[x] = Σ θ of the segments covering base x.
 #[no_mangle]
 pub extern "C" fn tt_density(sites: *const [u32; 4], n_sites: usize, length: usize, out: *mut f64) {
     let sites = unsafe { slice::from_raw_parts(sites, n_sites) };
@@ -312,7 +310,7 @@ pub extern "C" fn tt_smooth(x: *mut f64, length: usize, w: *const f64, radius: u
     }
 }
 
-/// Bin features: out[b, m] = Σ over sites of motif m of weight × overlap with bin b (= Σ site H × fraction inside the bin).
+/// Bin features: out[b, m] = Σ over segments of motif m of θ × overlap with bin b (= Σ θ_m(x) over the bases x of bin b).
 #[no_mangle]
 pub extern "C" fn tt_features(sites: *const [u32; 4], n_sites: usize, max_len: u32, edges: *const i64, n_edges: usize,
                               n_motifs: usize, out: *mut f64) {
