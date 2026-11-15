@@ -15,8 +15,10 @@ def lib():
         ptr = lambda dtype: np.ctypeslib.ndpointer(dtype=dtype, flags="C_CONTIGUOUS")
         err = [ct.c_char_p, ct.c_size_t]
         _lib.tt_histogram.argtypes = [ct.c_char_p, ct.c_char_p, ct.c_size_t, ptr(np.uint64), ct.c_char_p, ct.c_size_t, ct.POINTER(ct.c_size_t)] + err
-        _lib.tt_scan.argtypes = [ct.c_char_p, ct.c_char_p, ct.c_char_p, ptr(np.float32), ct.c_char_p, ct.c_char_p,
+        _lib.tt_scan.argtypes = [ct.c_char_p, ct.c_char_p, ct.c_char_p, ptr(np.float32), ct.c_char_p, ptr(np.float32), ct.c_size_t,
+                                 ptr(np.uint32), ptr(np.float32), ct.c_char_p, ct.c_char_p,
                                  ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_uint32), ct.POINTER(ct.c_uint32)] + err
+        _lib.tt_kmers.argtypes = [ct.c_char_p, ct.c_char_p, ptr(np.uint64)] + err
         _lib.tt_unpack.argtypes = [ct.c_char_p, ct.c_char_p, ct.c_uint32, ct.c_char_p, ct.c_char_p, ct.c_uint32, ct.POINTER(ct.c_uint64)] + err
         _lib.tt_threads.restype = ct.c_size_t
         _lib.tt_density.argtypes = [ptr(np.uint32), ct.c_size_t, ct.c_size_t, ptr(np.float64)]
@@ -41,14 +43,26 @@ def histogram(hits, chrom):
     return names.value.decode().split("\n")[:n.value], counts[:n.value]
 
 
-def scan(hits, chrom, motifs, table, sites_path, merge_path=None):
-    """Writes the segments of constant per-base occupancy to sites_path (and their merge records to merge_path, if given);
-    returns (number of segments, longest segment, end of the last segment)."""
+def scan(hits, chrom, motifs, table, sites_path, merge_path=None, exact=None):
+    """Writes the segments of constant per-base coverage evidence to sites_path (and their merge records to merge_path, if given);
+    returns (number of segments, longest segment, end of the last segment). table: a = L / (2W) by motif and score.
+    exact: (FASTA of the chromosome, log2 motif probabilities [motifs × wmax × 4], widths, log2 background transitions [64 × 4])
+    to compute L from the sequence instead of the score."""
     n, longest, end, error = ct.c_uint64(), ct.c_uint32(), ct.c_uint32(), ct.create_string_buffer(1024)
+    fasta, lp, widths, lt = exact or ("", np.zeros((len(motifs), 1, 4)), np.ones(len(motifs)), np.zeros((64, 4)))
+    lp = np.ascontiguousarray(lp, np.float32)
     _check(lib().tt_scan(os.fsencode(hits), chrom.encode(), "\n".join(motifs).encode(), np.ascontiguousarray(table, np.float32),
+                         os.fsencode(fasta), lp, lp.shape[1], np.ascontiguousarray(widths, np.uint32), np.ascontiguousarray(lt, np.float32),
                          os.fsencode(sites_path), os.fsencode(merge_path or ""), ct.byref(n), ct.byref(longest), ct.byref(end),
                          error, len(error)), error)
     return n.value, longest.value, end.value
+
+
+def kmers(fasta, chrom):
+    """Counts of the 256 4-mers of record `chrom` of a (gzipped) FASTA file, both strands; A/C/G/T only."""
+    counts, error = np.zeros(256, np.uint64), ct.create_string_buffer(1024)
+    _check(lib().tt_kmers(os.fsencode(fasta), chrom.encode(), counts, error, len(error)), error)
+    return counts
 
 
 def unpack(blocks, chrom, chrom_id, header, out, level):
@@ -64,7 +78,7 @@ def threads():
 
 
 def density(sites, length):
-    """Summed per-base occupancy of all motifs."""
+    """Summed per-base coverage evidence of all motifs."""
     out = np.empty(length)
     lib().tt_density(sites, len(sites), length, out)
     return out
@@ -79,7 +93,7 @@ def smooth(x, sigma, truncate=4.0):
 
 
 def features(sites, max_len, edges, n_motifs):
-    """Bin × motif matrix of Σ θ over the bases of the bin (expected occupied bases)."""
+    """Bin × motif matrix of the coverage evidence summed over the bases of the bin."""
     out = np.empty((len(edges) - 1, n_motifs))
     lib().tt_features(sites, len(sites), max_len, np.ascontiguousarray(edges, np.int64), len(edges), n_motifs, out)
     return out

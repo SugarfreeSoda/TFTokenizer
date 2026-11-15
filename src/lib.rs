@@ -1,6 +1,7 @@
-//! Rust core of TFTokenizer: stream motif hits, turn them into the per-base occupancy θ of every motif, and sum θ into bin features.
-//! A record is four little-endian u32: start, end, motif index, per-base weight θ (f32 bits) — one segment of constant θ.
-//! Records are written sorted by end. The optional merge record of a segment is u32 hits covering it + f32 Σa, in the same order.
+//! Rust core of TFTokenizer: stream motif hits, turn them into the per-base coverage evidence of every motif, and sum it into bin
+//! features. A record is four little-endian u32: start, end, motif index, per-base weight (f32 bits): one segment on which the
+//! evidence max(0, log2 Σa) is constant, a = L / (2W) for every hit of the motif covering the base. Records are written sorted by
+//! end. The optional merge record of a segment is u32 hits covering it + f32 Σa, in the same order.
 use flate2::{bufread::ZlibDecoder, read::MultiGzDecoder, write::GzEncoder, Compression};
 use rayon::prelude::*;
 use std::cmp::Reverse;
@@ -12,6 +13,8 @@ use std::slice;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const SCORES: usize = 1001;
+const ORDER: usize = 3;              // order of the Markov background
+const STATES: usize = 1 << (2 * ORDER);
 
 fn text<'a>(p: *const c_char) -> Result<&'a str> {
     Ok(unsafe { CStr::from_ptr(p) }.to_str()?)
@@ -44,30 +47,116 @@ fn score_bin(field: &[u8]) -> usize {
     digits.fold(0usize, |v, d| (v * 10 + (d - b'0') as usize).min(SCORES - 1))
 }
 
-/// Calls `f(start, end, motif, score_bin)` for every hit of `chrom` in a (gzipped) TSV with a UCSC JASPAR header.
-fn each_hit(path: &str, chrom: &str, mut f: impl FnMut(u32, u32, &[u8], usize) -> Result<()>) -> Result<()> {
+fn open(path: &str) -> Result<Box<dyn BufRead>> {
     let file = BufReader::with_capacity(1 << 20, File::open(path)?);
-    let mut input: Box<dyn BufRead> = if path.ends_with(".gz") {
-        Box::new(BufReader::with_capacity(1 << 20, MultiGzDecoder::new(file)))
-    } else {
-        Box::new(file)
+    Ok(if path.ends_with(".gz") { Box::new(BufReader::with_capacity(1 << 20, MultiGzDecoder::new(file))) } else { Box::new(file) })
+}
+
+/// Base code: A, C, G, T (either case) → 0–3, anything else → 4.
+fn base(b: u8) -> u8 {
+    match b {
+        b'A' | b'a' => 0,
+        b'C' | b'c' => 1,
+        b'G' | b'g' => 2,
+        b'T' | b't' => 3,
+        _ => 4,
+    }
+}
+
+/// Base codes of the FASTA record named `chrom` in a (gzipped) FASTA file.
+fn read_fasta(path: &str, chrom: &str) -> Result<Vec<u8>> {
+    let mut input = open(path)?;
+    let (mut seq, mut keep, mut found, mut line) = (Vec::new(), false, false, Vec::new());
+    while { line.clear(); input.read_until(b'\n', &mut line)? > 0 } {
+        let l = line.trim_ascii_end();
+        if let Some(head) = l.strip_prefix(b">") {
+            if found {
+                break;
+            }
+            keep = head.split(|b| b.is_ascii_whitespace()).next() == Some(chrom.as_bytes());
+            found = keep;
+        } else if keep {
+            seq.extend(l.iter().map(|&b| base(b)));
+        }
+    }
+    if !found {
+        return Err(format!("no sequence {chrom} in {path}").into());
+    }
+    Ok(seq)
+}
+
+/// Adds to counts[256] the (ORDER + 1)-mers of the FASTA record `chrom` that hold A/C/G/T only, on both strands
+/// (every word and its reverse complement). Word index: the bases read as a base-4 number, first base highest.
+#[no_mangle]
+pub extern "C" fn tt_kmers(fasta: *const c_char, chrom: *const c_char, counts: *mut u64, error: *mut u8, capacity: usize) -> i32 {
+    report((|| {
+        let counts = unsafe { slice::from_raw_parts_mut(counts, STATES * 4) };
+        let seq = read_fasta(text(fasta)?, text(chrom)?)?;
+        let k = ORDER + 1;
+        let (mut word, mut run) = (0usize, 0usize);
+        for &b in &seq {
+            if b > 3 {
+                run = 0;
+                continue;
+            }
+            word = ((word << 2) | b as usize) & (STATES * 4 - 1);
+            run += 1;
+            if run >= k {
+                let mut rc = 0;
+                for j in 0..k {
+                    rc = (rc << 2) | (3 - ((word >> (2 * j)) & 3));
+                }
+                counts[word] += 1;
+                counts[rc] += 1;
+            }
+        }
+        Ok(())
+    })(), error, capacity)
+}
+
+/// log2 L of one hit: Σ log2 p(b_l, l) − Σ log2 T(b_l | previous ORDER bases), the window read on the hit's strand (minus:
+/// reverse complement, its context the ORDER bases right of the hit). None if the window or its context leaves the sequence
+/// or holds a base other than A/C/G/T. lp: W × 4 log2 probabilities of the motif; lt: STATES × 4 log2 transitions.
+fn exact_log2(seq: &[u8], start: usize, w: usize, minus: bool, lp: &[f32], lt: &[f32]) -> Option<f64> {
+    if (!minus && start < ORDER) || start + w + ORDER > seq.len() + if minus { 0 } else { ORDER } {
+        return None;
+    }
+    let at = |j: usize| -> Option<usize> {
+        let b = if minus { seq[start + w + ORDER - 1 - j] } else { seq[start + j - ORDER] };
+        (b <= 3).then(|| if minus { 3 - b as usize } else { b as usize })
     };
+    let mut state = 0usize;
+    for j in 0..ORDER {
+        state = (state << 2) | at(j)?;
+    }
+    let mut total = 0f64;
+    for l in 0..w {
+        let b = at(l + ORDER)?;
+        total += lp[l * 4 + b] as f64 - lt[state * 4 + b] as f64;
+        state = ((state << 2) | b) & (STATES - 1);
+    }
+    Some(total)
+}
+
+/// Calls `f(start, end, motif, score_bin, minus strand)` for every hit of `chrom` in a (gzipped) TSV with a UCSC JASPAR header.
+fn each_hit(path: &str, chrom: &str, mut f: impl FnMut(u32, u32, &[u8], usize, bool) -> Result<()>) -> Result<()> {
+    let mut input = open(path)?;
     let mut line = Vec::new();
     input.read_until(b'\n', &mut line)?;
     let header: Vec<&[u8]> = line.trim_ascii_end().strip_prefix(b"#").unwrap_or(line.trim_ascii_end()).split(|&b| b == b'\t').collect();
     let column = |name: &str| header.iter().position(|h| *h == name.as_bytes()).ok_or(format!("missing column {name}"));
-    let index = [column("chrom")?, column("chromStart")?, column("chromEnd")?, column("name")?, column("score")?];
+    let index = [column("chrom")?, column("chromStart")?, column("chromEnd")?, column("name")?, column("score")?, column("strand")?];
     let last = *index.iter().max().unwrap();
     let mut line = Vec::with_capacity(256);
     while { line.clear(); input.read_until(b'\n', &mut line)? > 0 } {
-        let mut fields: [&[u8]; 5] = [b""; 5];
+        let mut fields: [&[u8]; 6] = [b""; 6];
         for (i, field) in line.trim_ascii_end().split(|&b| b == b'\t').enumerate().take(last + 1) {
             if let Some(k) = index.iter().position(|&j| j == i) {
                 fields[k] = field;
             }
         }
         if fields[0] == chrom.as_bytes() {
-            f(int(fields[1])?, int(fields[2])?, fields[3], score_bin(fields[4]))?;
+            f(int(fields[1])?, int(fields[2])?, fields[3], score_bin(fields[4]), fields[5] == b"-")?;
         }
     }
     Ok(())
@@ -81,7 +170,7 @@ pub extern "C" fn tt_histogram(hits: *const c_char, chrom: *const c_char, max_mo
         let counts = unsafe { slice::from_raw_parts_mut(counts, max_motifs * SCORES) };
         let mut order: Vec<Vec<u8>> = Vec::new();
         let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
-        each_hit(text(hits)?, text(chrom)?, |_, _, motif, score| {
+        each_hit(text(hits)?, text(chrom)?, |_, _, motif, score, _| {
             let k = match index.get(motif) {
                 Some(&k) => k,
                 None if order.len() < max_motifs => {
@@ -159,14 +248,13 @@ struct Sink {
 }
 
 impl Sink {
-    /// One segment on which the hits of a motif covering each base stay the same: θ = Σa / (1 + Σa) is its per-base weight.
-    /// The merge file, if any, gets the number of those hits and Σa (u32, f32) of the same segment.
+    /// One segment on which the hits of a motif covering each base stay the same: max(0, log2 Σa) is its per-base weight;
+    /// segments of weight 0 are not written. The merge file, if any, gets the number of those hits and Σa (u32, f32).
     fn write(&mut self, motif: usize, start: u32, end: u32, total: f64, hits: u32) -> Result<()> {
-        let theta = total / (1.0 + total);
-        if theta <= 0.0 {
+        if total <= 1.0 {
             return Ok(());
         }
-        for v in [start, end, motif as u32, (theta as f32).to_bits()] {
+        for v in [start, end, motif as u32, (total.log2() as f32).to_bits()] {
             self.out.write_all(&v.to_le_bytes())?;
         }
         if let Some(merge) = &mut self.merge {
@@ -181,42 +269,53 @@ impl Sink {
 }
 
 /// A hit of motif k ends at e: closes the open segment of k there and takes the hit's a out of Σa.
-fn expire(sink: &mut Sink, open: &mut [(u32, f64, u32)], (e, k, a): (u32, usize, u32)) -> Result<()> {
+fn expire(sink: &mut Sink, open: &mut [(u32, f64, u32)], (e, k, a): (u32, usize, u64)) -> Result<()> {
     let seg = &mut open[k];
     if e > seg.0 {
         sink.write(k, seg.0, e, seg.1, seg.2)?;
         seg.0 = e;
     }
     seg.2 -= 1;
-    seg.1 = if seg.2 == 0 { 0.0 } else { (seg.1 - f32::from_bits(a) as f64).max(0.0) };   // 0 hits: drop rounding residue
+    seg.1 = if seg.2 == 0 { 0.0 } else { (seg.1 - f64::from_bits(a)).max(0.0) };   // 0 hits: drop rounding residue
     Ok(())
 }
 
-/// Per-base occupancy of every motif (both strands): each base gets θ = Σa / (1 + Σa) over the hits of the motif covering it.
-/// Writes the segments of constant θ sorted by end. `table[m * 1001 + score]` is the rank odds a of motif m.
-/// Also returns the longest segment and the last hit end. An empty `merge` path skips the merge file.
-/// Hits must be sorted by chromStart (bigBedToBed output is).
+/// Per-base coverage evidence of every motif (both strands): each base gets max(0, log2 Σa) over the hits of the motif covering
+/// it, a = L / (2W). Writes the segments of constant evidence sorted by end. `table[m * 1001 + score]` is a of motif m by score
+/// (L of the score). With a FASTA path (`fasta` non-empty) L is computed from the sequence instead: `lp[m * wmax * 4 ..]` holds the
+/// log2 probabilities of motif m, `widths[m]` its width, `lt` the log2 transitions of the background; hits whose window or context
+/// leaves the sequence or holds N fall back to the table. Also returns the longest segment and the last hit end. An empty `merge`
+/// path skips the merge file. Hits must be sorted by chromStart (bigBedToBed output is).
 #[no_mangle]
 pub extern "C" fn tt_scan(hits: *const c_char, chrom: *const c_char, motifs: *const c_char, table: *const f32,
+                          fasta: *const c_char, lp: *const f32, wmax: usize, widths: *const u32, lt: *const f32,
                           sites: *const c_char, merge: *const c_char, n_sites: *mut u64, max_len: *mut u32, max_end: *mut u32,
                           error: *mut u8, capacity: usize) -> i32 {
     report((|| {
         let names: HashMap<&[u8], usize> = text(motifs)?.as_bytes().split(|&b| b == b'\n').enumerate().map(|(i, m)| (m, i)).collect();
         let table = unsafe { slice::from_raw_parts(table, names.len() * SCORES) };
+        let genome = match text(fasta)? {
+            "" => None,
+            path => Some(read_fasta(path, text(chrom)?)?),
+        };
+        let lp = unsafe { slice::from_raw_parts(lp, names.len() * wmax * 4) };
+        let widths = unsafe { slice::from_raw_parts(widths, names.len()) };
+        let lt = unsafe { slice::from_raw_parts(lt, STATES * 4) };
         let merge = match text(merge)? {
             "" => None,
             path => Some(BufWriter::with_capacity(1 << 22, File::create(path)?)),
         };
         let mut sink = Sink { out: BufWriter::with_capacity(1 << 22, File::create(text(sites)?)?), merge, count: 0, longest: 0, max_end: 0 };
         let mut open = vec![(0u32, 0f64, 0u32); names.len()];   // per motif: start of the open segment, Σa and number of hits covering it
-        let mut heap: BinaryHeap<Reverse<(u32, usize, u32)>> = BinaryHeap::new();   // (end, motif, a as f32 bits) of every hit not yet ended
+        let mut heap: BinaryHeap<Reverse<(u32, usize, u64)>> = BinaryHeap::new();   // (end, motif, a as f64 bits) of every hit not yet ended
         let mut previous = 0;
-        each_hit(text(hits)?, text(chrom)?, |start, end, motif, score| {
+        each_hit(text(hits)?, text(chrom)?, |start, end, motif, score, minus| {
             if start < previous || start >= end {
                 return Err(format!("hits must be sorted by chromStart (at {start}-{end})").into());
             }
             previous = start;
             let Some(&m) = names.get(motif) else { return Ok(()) };
+            sink.max_end = sink.max_end.max(end);              // tokens reach the last hit, also when its evidence is 0
             while let Some(&Reverse(hit)) = heap.peek() {
                 if hit.0 > start {
                     break;
@@ -224,12 +323,21 @@ pub extern "C" fn tt_scan(hits: *const c_char, chrom: *const c_char, motifs: *co
                 heap.pop();
                 expire(&mut sink, &mut open, hit)?;
             }
-            let a = table[m * SCORES + score];
+            let mut a = table[m * SCORES + score] as f64;
+            if let Some(seq) = &genome {
+                let w = widths[m] as usize;
+                if (end - start) as usize != w {
+                    return Err(format!("hit {start}-{end} of {} is not {w} bp long", String::from_utf8_lossy(motif)).into());
+                }
+                if let Some(l) = exact_log2(seq, start as usize, w, minus, &lp[m * wmax * 4..(m * wmax + w) * 4], lt) {
+                    a = l.exp2() / (2 * w) as f64;
+                }
+            }
             let seg = &mut open[m];
             if seg.2 > 0 && start > seg.0 {
                 sink.write(m, seg.0, start, seg.1, seg.2)?;
             }
-            *seg = (start, seg.1 + a as f64, seg.2 + 1);
+            *seg = (start, seg.1 + a, seg.2 + 1);
             heap.push(Reverse((end, m, a.to_bits())));
             Ok(())
         })?;

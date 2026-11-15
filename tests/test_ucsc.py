@@ -7,7 +7,7 @@ import threading
 import zlib
 import numpy as np
 import pytest
-from tftokenizer import download, ucsc
+from tftokenizer import download, download_genome, download_matrices, ucsc
 
 SQL = b"""table JASPAR_TFBSs
 "JASPAR TFBSs genome tracks"
@@ -72,6 +72,11 @@ def server():
             self.head(200, len(httpd.data))
 
         def do_GET(self):
+            if self.headers["Range"] is None:
+                httpd.ranges.append(None)
+                self.head(200, len(httpd.data))
+                self.wfile.write(httpd.data)
+                return
             lo, hi = map(int, self.headers["Range"].removeprefix("bytes=").split("-"))
             hi = min(hi, len(httpd.data) - 1)
             httpd.ranges.append((lo, hi + 1))
@@ -118,3 +123,28 @@ def test_download(tmp_path, server):
     assert server.ranges == []
     with pytest.raises(KeyError):
         download("chr3", out, mirror=server.mirror)
+
+
+def test_download_genome_and_matrices(tmp_path, server, monkeypatch):
+    server.data = gzip.compress(b">chr5\nACGTNacgt\nTTGA\n")
+    out = tmp_path / "genome"
+    out.mkdir()
+    (out / ".chr5.fa.gz.part").write_bytes(server.data[:7])                       # an interrupted download
+    [path] = download_genome(["chr5"], out, mirror=server.mirror)
+    assert path.read_bytes() == server.data and (7, len(server.data)) in server.ranges
+    source = json.loads((out / "chr5.json").read_text())
+    assert source["url"] == f"{server.mirror}/goldenPath/hg38/chromosomes/chr5.fa.gz" and source["bytes"] == len(server.data)
+    assert sorted(p.name for p in out.iterdir()) == ["chr5.fa.gz", "chr5.json"]
+    server.ranges.clear()
+    download_genome("chr5", out, mirror=server.mirror)                              # already there: no request
+    assert server.ranges == []
+
+    server.data = b"MEME version 4\n"
+    monkeypatch.setattr(ucsc, "matrices_url", lambda release: f"{server.mirror}/{release}.meme")
+    path = download_matrices(tmp_path, "JASPAR2026")
+    assert path.name == "JASPAR2026_CORE_vertebrates_non-redundant_pfms_meme.txt" and path.read_bytes() == server.data
+    assert json.loads((tmp_path / "JASPAR2026_CORE_vertebrates_non-redundant_pfms_meme.json").read_text())["release"] == "JASPAR2026"
+    server.ranges.clear()
+    download_matrices(tmp_path, "JASPAR2026")
+    assert server.ranges == []
+    assert ucsc.matrices_url.__name__ == "<lambda>" and ucsc.genome_url("chr1").endswith("/goldenPath/hg38/chromosomes/chr1.fa.gz")
