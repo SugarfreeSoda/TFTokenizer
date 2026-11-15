@@ -1,7 +1,8 @@
-"""Motif hits of chosen chromosomes from the UCSC JASPAR bigBed track, without the whole file (196 GB for hg38 JASPAR2026).
-The data blocks of one chromosome lie contiguously in the file: their byte span is found through the chromosome B+ tree and
-the R-tree index (a few small range requests), fetched in one resumable range request and unpacked to <chrom>.tsv.gz, the
-table `bigBedToBed -chrom=<chrom> -tsv` writes."""
+"""Inputs from public servers. Motif hits of chosen chromosomes from the UCSC JASPAR bigBed track, without the whole file
+(196 GB for hg38 JASPAR2026): the data blocks of one chromosome lie contiguously in the file; their byte span is found through the
+chromosome B+ tree and the R-tree index (a few small range requests), fetched in one resumable range request and unpacked to
+<chrom>.tsv.gz, the table `bigBedToBed -chrom=<chrom> -tsv` writes. Chromosome sequences from UCSC goldenPath
+(<assembly>/chromosomes/<chrom>.fa.gz) and the JASPAR matrices (MEME format) of the track's release from the JASPAR website."""
 import hashlib
 import http.client
 import json
@@ -20,8 +21,19 @@ TIMEOUT = 60      # seconds without data before an attempt fails
 LOG_EVERY = 30    # seconds between progress messages
 
 
+COLLECTION = "CORE_vertebrates_non-redundant"   # JASPAR collection of the UCSC JASPAR track
+
+
 def url(assembly="hg38", release="JASPAR2026", mirror=MIRROR):
     return f"{mirror.rstrip('/')}/gbdb/{assembly}/jaspar/{release}.bb"
+
+
+def genome_url(chrom, assembly="hg38", mirror=MIRROR):
+    return f"{mirror.rstrip('/')}/goldenPath/{assembly}/chromosomes/{chrom}.fa.gz"
+
+
+def matrices_url(release="JASPAR2026"):
+    return f"https://jaspar.elixir.no/download/data/{release[-4:]}/CORE/{release}_{COLLECTION}_pfms_meme.txt"
 
 
 class _Remote:
@@ -29,7 +41,7 @@ class _Remote:
 
     def __init__(self, url):
         with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=TIMEOUT) as r:
-            self.url, self.modified = url, r.headers.get("Last-Modified", "")
+            self.url, self.modified, self.size = url, r.headers.get("Last-Modified", ""), int(r.headers.get("Content-Length", -1))
 
     def open(self, start, end):
         """Response streaming bytes [start, end); refused if the file changed since __init__ (If-Range)."""
@@ -139,3 +151,50 @@ def download(chroms, out="hits", assembly="hg38", release="JASPAR2026", mirror=M
         if log:
             log(f"{chrom}: {rows:,} hits → {path} ({source['seconds']:.0f} s)")
     return paths
+
+
+def _record(path, remote, t, **extra):
+    with open(path, "rb") as f:
+        sha256 = hashlib.file_digest(f, "sha256").hexdigest()
+    source = dict(url=remote.url, last_modified=remote.modified, bytes=path.stat().st_size, sha256=sha256, **extra,
+                  seconds=round(time.time() - t, 1), downloaded=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    path.with_name(path.name.split(".")[0] + ".json").write_text(json.dumps(source, indent=1))
+
+
+def download_genome(chroms, out="genome", assembly="hg38", mirror=MIRROR, log=None):
+    """Writes the sequence of each chromosome to out/<chrom>.fa.gz (UCSC goldenPath) and its source and SHA-256 to
+    out/<chrom>.json. Chromosomes whose file exists are skipped; an interrupted download resumes. Returns the FASTA paths."""
+    out, paths = Path(out), []
+    out.mkdir(parents=True, exist_ok=True)
+    for chrom in [chroms] if isinstance(chroms, str) else chroms:
+        path = out / f"{chrom}.fa.gz"
+        paths.append(path)
+        if path.exists():
+            continue
+        t, remote = time.time(), _Remote(genome_url(chrom, assembly, mirror))
+        if remote.size < 0:
+            raise RuntimeError(f"{remote.url} gives no Content-Length")
+        part = out / f".{chrom}.fa.gz.part"
+        if log:
+            log(f"{chrom}: downloading {remote.size / 2**20:.0f} MiB from {remote.url}")
+        _fetch(remote, 0, remote.size, part, chrom, log)
+        part.replace(path)
+        _record(path, remote, t, chrom=chrom)
+    return paths
+
+
+def download_matrices(out=".", release="JASPAR2026", log=None):
+    """Writes the JASPAR matrices of the release (MEME format, collection COLLECTION) to out/ and its source and SHA-256 next to it.
+    Skipped if the file exists. Returns its path."""
+    path = Path(out) / f"{release}_{COLLECTION}_pfms_meme.txt"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        t, remote = time.time(), _Remote(matrices_url(release))
+        if log:
+            log(f"matrices: downloading {remote.url}")
+        tmp = path.with_name(f".{path.name}.tmp")
+        with urllib.request.urlopen(remote.url, timeout=TIMEOUT) as r, open(tmp, "wb") as f:
+            f.write(r.read())
+        tmp.replace(path)
+        _record(path, remote, t, release=release)
+    return path

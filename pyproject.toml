@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tftokenizer"
-version = "0.2.0"
-description = "Tokenize the genome into bins carrying the expected occupied bases of every transcription-factor motif"
+version = "0.3.0"
+description = "Tokenize the genome into bins carrying the coverage evidence of every transcription-factor motif"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
